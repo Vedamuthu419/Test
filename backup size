@@ -1,66 +1,3 @@
-SELECT 
-    [DBNmae],
-    [backupType],
-    [BackupStartDate],
-    [BackupSize],
-    [PhysicalDeviceName]
-FROM [DBADB].[dbo].[BackupInfoData]
-WHERE [DBNmae] = 'MARSPROD'
-  AND [backupType] = 'DIFFERENTIAL'
-  AND [BackupStartDate] >= DATEADD(DAY, -7, GETDATE())
-ORDER BY [BackupStartDate] DESC;
-
-
-SELECT 
-    [DBNmae] AS database_name,
-    [BackupStartDate] AS backup_start_date,
-    [BackupEndTime] AS backup_finish_date,
-    [backupType] AS BackupType,
-    CAST([BackupSize]/1024.0/1024.0/1024.0 AS DECIMAL(18,2)) AS Actual_Backup_Size_GB,
-    CAST([CompressedBackupSize]/1024.0/1024.0/1024.0 AS DECIMAL(18,2)) AS Compress_Backup_Size_GB,
-    [PhysicalDeviceName] AS physical_device_name
-FROM [DBADB].[dbo].[BackupInfoData]
-WHERE [DBNmae] = 'MARSPROD'
-  AND [backupType] = 'DIFFERENTIAL'
-  AND [BackupStartDate] >= DATEADD(DAY, -7, GETDATE())
-ORDER BY [BackupStartDate] DESC;
-
-
-SELECT  
-    bs.database_name,
-    bs.backup_start_date,
-    bs.backup_finish_date,
-    CASE bs.type
-        WHEN 'D' THEN 'Database'
-        WHEN 'I' THEN 'Differential'
-        WHEN 'L' THEN 'Log'
-        ELSE bs.type
-    END AS BackupType,
-    CAST(bs.backup_size / 1024.0 / 1024.0 / 1024.0 AS DECIMAL(18,2)) AS Actual_Backup_Size_GB,
-    CAST(bs.compressed_backup_size / 1024.0 / 1024.0 / 1024.0 AS DECIMAL(18,2)) AS Compress_Backup_Size_GB,
-    bmf.physical_device_name
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupmediafamily bmf 
-    ON bs.media_set_id = bmf.media_set_id
-WHERE bs.database_name = 'MARSPROD'
-  AND bs.type = 'I'   -- 'I' = Differential backup
-  AND bs.backup_start_date >= DATEADD(DAY, -7, GETDATE())
-ORDER BY bs.backup_start_date DESC;
-
-
-SELECT
-    [DBNmae] AS database_name,
-    [BackupStartDate] AS backup_start_date,
-    [BackupEndTime] AS backup_finish_date,
-    [backupType] AS BackupType,
-    CAST([BackupSize]/1024.0/1024.0/1024.0 AS DECIMAL(18,2)) AS Actual_Backup_Size_GB,
-    [PhysicalDeviceName] AS physical_device_name
-FROM [DBADB].[dbo].[BackupInfoData]
-WHERE [DBNmae] = 'MARSPROD'
-  AND [backupType] = 'DIFFERENTIAL'
-  AND [BackupStartDate] >= DATEADD(DAY, -7, GETDATE())
-ORDER BY [BackupStartDate] DESC;
-
 
 SELECT  
     bs.database_name,
@@ -79,6 +16,7 @@ FROM msdb.dbo.backupset bs
 JOIN msdb.dbo.backupmediafamily bmf 
     ON bs.media_set_id = bmf.media_set_id
 WHERE bs.database_name = 'MARSPROD'
+  AND bs.type = 'I'
   AND bs.backup_start_date >= DATEADD(DAY, -7, GETDATE())
 ORDER BY bs.backup_start_date DESC;
 
