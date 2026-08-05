@@ -1,0 +1,508 @@
+-- ================================================
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:        Vedamuthu
+-- Create date:   Aug 05, 2026
+-- Description:   On-Premise SQL Server Agent Job (Monthly_AllDB_Backup)
+-- =============================================
+CREATE OR ALTER PROCEDURE dbo.OnPrem_BackupStatusReport
+    @JobName        NVARCHAR(255) = 'Monthly_AllDB_Backup.Subplan_1',  -- SQL Agent job name (as seen in Job History Viewer)
+    @PollDelayMin   INT           = 5,       -- if job still running, wait this many minutes and re-check
+    @ProfileName    NVARCHAR(255) = '',      -- Database Mail profile name
+    @Recipients     NVARCHAR(500) = ''       -- mail recipients
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @ReportDate      DATE     = CAST(GETDATE() AS DATE);
+    DECLARE @Html            NVARCHAR(MAX);
+    DECLARE @Rows            NVARCHAR(MAX);
+    DECLARE @Summary         NVARCHAR(MAX);
+    DECLARE @ServerName      NVARCHAR(128) = CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128));
+
+    DECLARE @JobID           UNIQUEIDENTIFIER;
+    DECLARE @IsRunning       BIT = 1;
+    DECLARE @Delay           CHAR(8);
+
+    ------------------------------------------------------------
+    -- 0) Resolve Job
+    ------------------------------------------------------------
+    SELECT @JobID = job_id
+    FROM msdb.dbo.sysjobs
+    WHERE name = @JobName;
+
+    IF @JobID IS NULL
+    BEGIN
+        RAISERROR('Job "%s" not found in msdb.dbo.sysjobs. Check job name.', 16, 1, @JobName);
+        RETURN;
+    END
+
+    ------------------------------------------------------------
+    -- 1) If the job is currently executing, poll every N minutes
+    --    until it finishes (mirrors the RDS async-wait behaviour;
+    --    on-prem job steps run synchronously, this only matters
+    --    if this report SP is fired from a *separate* schedule)
+    ------------------------------------------------------------
+    WHILE @IsRunning = 1
+    BEGIN
+        SELECT @IsRunning =
+            CASE WHEN EXISTS
+            (
+                SELECT 1
+                FROM msdb.dbo.sysjobactivity ja
+                WHERE ja.job_id = @JobID
+                  AND ja.start_execution_date IS NOT NULL
+                  AND ja.stop_execution_date  IS NULL
+                  AND ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
+            )
+            THEN 1 ELSE 0 END;
+
+        IF @IsRunning = 1
+        BEGIN
+            SET @Delay = '00:0' + CAST(@PollDelayMin AS CHAR(1)) + ':00';
+            WAITFOR DELAY @Delay;
+        END
+    END
+
+    ------------------------------------------------------------
+    -- 2) Overall job outcome for today (step_id = 0 = job summary row)
+    ------------------------------------------------------------
+    DECLARE @JobRunStatus     INT,
+            @JobRunDurationRaw INT,
+            @JobMessage       NVARCHAR(MAX),
+            @JobStartDateTime DATETIME,
+            @JobEndDateTime   DATETIME;
+
+    ;WITH JobHist AS
+    (
+        SELECT TOP 1
+               run_status,
+               run_duration,
+               message,
+               msdb.dbo.agent_datetime(run_date, run_time) AS RunStart
+        FROM msdb.dbo.sysjobhistory
+        WHERE job_id  = @JobID
+          AND step_id = 0
+          AND run_date = CONVERT(INT, CONVERT(CHAR(8), @ReportDate, 112))
+        ORDER BY run_date DESC, run_time DESC
+    )
+    SELECT
+        @JobRunStatus      = run_status,
+        @JobRunDurationRaw = run_duration,
+        @JobMessage        = message,
+        @JobStartDateTime  = RunStart
+    FROM JobHist;
+
+    IF @JobStartDateTime IS NOT NULL
+        SET @JobEndDateTime = DATEADD(SECOND,
+              (@JobRunDurationRaw / 10000) * 3600
+            + ((@JobRunDurationRaw / 100) % 100) * 60
+            + (@JobRunDurationRaw % 100),
+            @JobStartDateTime);
+
+    DECLARE @JobOverallStatus NVARCHAR(20) =
+        CASE @JobRunStatus
+            WHEN 1 THEN 'SUCCESS'
+            WHEN 0 THEN 'FAILED'
+            WHEN 2 THEN 'RETRY'
+            WHEN 3 THEN 'CANCELLED'
+            WHEN 4 THEN 'IN_PROGRESS'
+            ELSE 'UNKNOWN'
+        END;
+
+    ------------------------------------------------------------
+    -- 3) Expected database list (exclude system DBs; adjust filter
+    --    to match what your Monthly_AllDB_Backup subplan covers)
+    ------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#DBList') IS NOT NULL DROP TABLE #DBList;
+    CREATE TABLE #DBList (DatabaseName SYSNAME PRIMARY KEY);
+
+    INSERT INTO #DBList (DatabaseName)
+    SELECT name
+    FROM sys.databases
+    WHERE database_id > 4                 -- excludes master/model/msdb/tempdb
+      AND state_desc = 'ONLINE'
+      AND is_read_only = 0;
+
+    ------------------------------------------------------------
+    -- 4) Actual backups completed today, from real backup history
+    --    (this is the authoritative on-prem equivalent of
+    --     rds_task_status - no text-parsing required)
+    ------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#Report') IS NOT NULL DROP TABLE #Report;
+    CREATE TABLE #Report
+    (
+        DatabaseName     SYSNAME,
+        BackupType       NVARCHAR(20)   NULL,
+        StartTime        DATETIME       NULL,
+        EndTime          DATETIME       NULL,
+        DurationMinutes  INT            NULL,
+        BackupSizeMB     DECIMAL(18,2)  NULL,
+        DevicePath       NVARCHAR(500)  NULL,
+        UserName         NVARCHAR(128)  NULL,
+        Status           NVARCHAR(20)
+    );
+
+    INSERT INTO #Report
+    (
+        DatabaseName, BackupType, StartTime, EndTime,
+        DurationMinutes, BackupSizeMB, DevicePath, UserName, Status
+    )
+    SELECT
+        bs.database_name,
+        CASE bs.type
+            WHEN 'D' THEN 'FULL'
+            WHEN 'I' THEN 'DIFFERENTIAL'
+            WHEN 'L' THEN 'LOG'
+            WHEN 'F' THEN 'FILE/FILEGROUP'
+            ELSE bs.type
+        END,
+        bs.backup_start_date,
+        bs.backup_finish_date,
+        DATEDIFF(MINUTE, bs.backup_start_date, bs.backup_finish_date),
+        CAST(bs.backup_size / 1048576.0 AS DECIMAL(18,2)),
+        bmf.physical_device_name,
+        bs.user_name,
+        'SUCCESS'
+    FROM msdb.dbo.backupset bs
+    INNER JOIN msdb.dbo.backupmediafamily bmf
+        ON bmf.media_set_id = bs.media_set_id
+    WHERE CAST(bs.backup_finish_date AS DATE) = @ReportDate
+      AND bs.database_name IN (SELECT DatabaseName FROM #DBList)
+      AND bs.type = 'D';           -- FULL backups only; remove/adjust to include diff/log
+
+    -- Any expected database with NO backup today -> flag as MISSING
+    INSERT INTO #Report
+    (
+        DatabaseName, BackupType, StartTime, EndTime,
+        DurationMinutes, BackupSizeMB, DevicePath, UserName, Status
+    )
+    SELECT
+        dl.DatabaseName, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'MISSING'
+    FROM #DBList dl
+    WHERE NOT EXISTS (SELECT 1 FROM #Report r WHERE r.DatabaseName = dl.DatabaseName);
+
+    ------------------------------------------------------------
+    -- 5) Counts for summary
+    ------------------------------------------------------------
+    DECLARE @TotalCount      INT = 0,
+            @SuccessCount    INT = 0,
+            @MissingCount    INT = 0,
+            @TotalDuration   INT = 0;
+
+    SELECT @TotalCount    = COUNT(*)                              FROM #Report;
+    SELECT @SuccessCount  = COUNT(*) FROM #Report WHERE Status = 'SUCCESS';
+    SELECT @MissingCount  = COUNT(*) FROM #Report WHERE Status = 'MISSING';
+    SELECT @TotalDuration = SUM(ISNULL(DurationMinutes,0))        FROM #Report;
+
+    ------------------------------------------------------------
+    -- 6) Summary card HTML (same style as RDS report)
+    ------------------------------------------------------------
+    SET @Summary = N'
+    <table class="summary" border="1" cellpadding="8" cellspacing="0">
+      <tr>
+        <th colspan="2">Backup Run Summary</th>
+      </tr>
+      <tr><td>Server</td>
+          <td><strong>' + ISNULL(REPLACE(REPLACE(REPLACE(@ServerName,'&','&amp;'),'<','&lt;'),'>','&gt;'),'') + N'</strong></td></tr>
+      <tr><td>Job Name</td>
+          <td><strong>' + ISNULL(REPLACE(REPLACE(REPLACE(@JobName,'&','&amp;'),'<','&lt;'),'>','&gt;'),'') + N'</strong></td></tr>
+      <tr><td>Report Date</td>
+          <td><strong>' + CONVERT(NVARCHAR(30), @ReportDate, 106) + N'</strong></td></tr>
+      <tr>
+        <td>Job Status</td>
+        <td><span class="badge ' + CASE @JobOverallStatus
+                WHEN 'SUCCESS' THEN 'badge-success'
+                WHEN 'FAILED'  THEN 'badge-error'
+                WHEN 'IN_PROGRESS' THEN 'badge-progress'
+                ELSE 'badge-cancelled' END
+            + N'">' + ISNULL(@JobOverallStatus,'UNKNOWN') + N'</span></td>
+      </tr>
+      <tr>
+        <td>DB Backup Completed</td>
+        <td><span class="badge badge-success">'    + CAST(@SuccessCount AS NVARCHAR(10)) + N'</span></td>
+      </tr>
+      <tr>
+        <td>Missing / Not Backed Up</td>
+        <td><span class="badge badge-error">'      + CAST(@MissingCount AS NVARCHAR(10)) + N'</span></td>
+      </tr>
+      <tr>
+        <td>Total Backup Duration</td>
+        <td>' + CAST(ISNULL(@TotalDuration, 0) AS NVARCHAR(10)) + N' minutes</td>
+      </tr>
+    </table><br/>';
+
+    ------------------------------------------------------------
+    -- 7) Detailed rows HTML
+    ------------------------------------------------------------
+    SELECT @Rows =
+    (
+        SELECT
+            N'<tr class="' + CASE
+                WHEN r.Status = 'SUCCESS' THEN 'row-success'
+                WHEN r.Status = 'MISSING' THEN 'row-error'
+                ELSE 'row-other'
+            END + N'">'
+
+          -- Database
+          + N'<td><strong>'
+                + ISNULL(REPLACE(REPLACE(REPLACE(r.DatabaseName,'&','&amp;'),'<','&lt;'),'>','&gt;'), '')
+          + N'</strong></td>'
+
+          -- Backup Type
+          + N'<td style="text-align:center;">'
+                + ISNULL(r.BackupType, '&mdash;')
+          + N'</td>'
+
+          -- Start Time
+          + N'<td>' + ISNULL(CONVERT(NVARCHAR(19), r.StartTime, 120), '&mdash;') + N'</td>'
+
+          -- End Time
+          + N'<td>' + ISNULL(CONVERT(NVARCHAR(19), r.EndTime, 120), '&mdash;') + N'</td>'
+
+          -- Duration
+          + N'<td style="text-align:center;">'
+                + ISNULL(CAST(r.DurationMinutes AS NVARCHAR(20)) + ' min', '&mdash;')
+          + N'</td>'
+
+          -- Status badge
+          + N'<td style="text-align:center;">'
+                + CASE r.Status
+                    WHEN 'SUCCESS' THEN N'<span class="badge badge-success">SUCCESS</span>'
+                    WHEN 'MISSING' THEN N'<span class="badge badge-error">MISSING</span>'
+                    ELSE N'<span class="badge badge-cancelled">' + ISNULL(r.Status,'N/A') + N'</span>'
+                  END
+          + N'</td>'
+
+          -- Size (MB)
+          + N'<td style="text-align:center;">'
+                + ISNULL(CAST(r.BackupSizeMB AS NVARCHAR(20)) + ' MB', '&mdash;')
+          + N'</td>'
+
+          -- Device Path
+          + N'<td style="word-break:break-all;font-size:11px;">'
+                + ISNULL(REPLACE(REPLACE(REPLACE(r.DevicePath,'&','&amp;'),'<','&lt;'),'>','&gt;'), '&mdash;')
+          + N'</td>'
+
+          -- Executed By
+          + N'<td style="font-size:11px;color:#555;">'
+                + ISNULL(REPLACE(REPLACE(REPLACE(r.UserName,'&','&amp;'),'<','&lt;'),'>','&gt;'), '&mdash;')
+          + N'</td>'
+
+          + N'</tr>'
+        FROM #Report r
+        ORDER BY CASE WHEN r.Status = 'MISSING' THEN 0 ELSE 1 END, r.StartTime, r.DatabaseName
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)');
+
+    ------------------------------------------------------------
+    -- 8) Assemble final HTML (same CSS as RDS report)
+    ------------------------------------------------------------
+    SET @Html = N'
+    <html>
+    <head>
+    <style>
+      body {
+          font-family: "Segoe UI", Arial, Helvetica, sans-serif;
+          font-size: 13px;
+          color: #1a1a1a;
+          margin: 0;
+          padding: 10px;
+          background-color: #ffffff;
+      }
+
+      .title {
+          font-size: 22px;
+          font-weight: bold;
+          color: #1e3a5f;
+          margin: 0 0 16px 0;
+          padding: 0 0 8px 0;
+          border-bottom: 2px solid #1e3a5f;
+      }
+
+      .section-header {
+          background-color: #1e3a5f;
+          color: #ffffff;
+          font-size: 14px;
+          font-weight: bold;
+          padding: 8px 12px;
+          margin: 20px 0 0 0;
+          border-radius: 4px 4px 0 0;
+      }
+
+      table {
+          border-collapse: collapse;
+          border-spacing: 0;
+          mso-table-lspace: 0pt;
+          mso-table-rspace: 0pt;
+          width: 100%;
+      }
+
+      table.summary {
+          width: 450px;
+          border: 1px solid #d0d7de;
+          margin-bottom: 16px;
+      }
+
+      table.summary th {
+          background-color: #f6f8fa;
+          color: #24292f;
+          padding: 8px 12px;
+          font-size: 14px;
+          text-align: left;
+          border-bottom: 1px solid #d0d7de;
+      }
+
+      table.summary td {
+          padding: 8px 12px;
+          color: #333333;
+          border: 1px solid #d0d7de;
+      }
+
+      table.detail {
+          border: 1px solid #d0d7de;
+      }
+
+      table.detail th {
+          background-color: #f6f8fa;
+          color: #24292f;
+          padding: 10px 8px;
+          font-size: 12px;
+          text-align: left;
+          border: 1px solid #d0d7de;
+          white-space: nowrap;
+      }
+
+      table.detail td {
+          padding: 8px;
+          border: 1px solid #d0d7de;
+          vertical-align: top;
+      }
+
+      tr.row-success td {
+          background-color: #ffffff;
+          border-left: 4px solid #16a34a;
+      }
+
+      tr.row-error td {
+          background-color: #fff5f5;
+          border-left: 4px solid #dc2626;
+      }
+
+      tr.row-progress td {
+          background-color: #fffaf0;
+          border-left: 4px solid #d97706;
+      }
+
+      tr.row-cancelled td {
+          background-color: #f5f5f5;
+          border-left: 4px solid #6b7280;
+      }
+
+      tr.row-other td {
+          background-color: #ffffff;
+          border-left: 4px solid #9ca3af;
+      }
+
+      .badge {
+          display: inline-block;
+          padding: 3px 8px;
+          font-size: 11px;
+          font-weight: bold;
+          border-radius: 12px;
+          border: 1px solid #cccccc;
+          color: #000000;
+          background-color: #f2f2f2;
+          text-align: center;
+      }
+
+      .badge-success {
+          background-color: #dcfce7;
+          color: #15803d;
+          border: 1px solid #b7dfc2;
+      }
+
+      .badge-error {
+          background-color: #fee2e2;
+          color: #b91c1c;
+          border: 1px solid #efb5b5;
+      }
+
+      .badge-progress {
+          background-color: #fff3cd;
+          color: #8a6d3b;
+          border: 1px solid #f0d58a;
+      }
+
+      .badge-created {
+          background-color: #e8f0fe;
+          color: #1a73e8;
+          border: 1px solid #b7cef7;
+      }
+
+      .badge-cancelled {
+          background-color: #eeeeee;
+          color: #555555;
+          border: 1px solid #cccccc;
+      }
+    </style>
+    </head>
+    <body>
+
+    <div class="title">On-Premise SQL Server Backup Status Report</div>
+
+    ' + @Summary + N'
+
+    <div class="section-header">Monthly Database Backup Logs</div>
+
+    <table class="detail" border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+      <tr>
+        <th>Database</th>
+        <th>Type</th>
+        <th>Start Time</th>
+        <th>End Time</th>
+        <th>Duration</th>
+        <th>Status</th>
+        <th>Size</th>
+        <th>Device Path</th>
+        <th>Executed By</th>
+       </tr>
+      ' + ISNULL(@Rows, N'<tr><td colspan="9" style="text-align:center;color:#888;">No backup records found for today.</td></tr>') + N'
+    </table>
+
+    </body>
+    </html>';
+
+    ------------------------------------------------------------
+    -- 9) Send Database Mail
+    ------------------------------------------------------------
+    DECLARE @EmailSubject NVARCHAR(500);
+
+    SET @EmailSubject =
+        '[' + ISNULL(@JobOverallStatus,'UNKNOWN') + '] ' + @ServerName + ' Monthly Backup Report - '
+        + CONVERT(VARCHAR, @ReportDate, 106)
+        + '  |  Total: ' + CAST(@TotalCount   AS VARCHAR)
+        + '  OK: '       + CAST(@SuccessCount AS VARCHAR)
+        + '  Missing: '  + CAST(@MissingCount AS VARCHAR);
+
+    IF @Html IS NOT NULL
+    BEGIN
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = @ProfileName,   -- pass your DB Mail profile name
+            @recipients   = @Recipients,    -- pass mail IDs
+            @subject      = @EmailSubject,
+            @body         = @Html,
+            @body_format  = 'HTML';
+    END
+
+    ------------------------------------------------------------
+    -- 10) Cleanup
+    ------------------------------------------------------------
+    DROP TABLE IF EXISTS #DBList;
+    DROP TABLE IF EXISTS #Report;
+
+END
+GO
