@@ -436,3 +436,88 @@ background:#F4F6F6;
 END
 GO
 
+
+
+
+
+
+
+------------------------------------------------------------
+-- Summary
+------------------------------------------------------------
+
+-- Databases backed up today (Step 1)
+SELECT
+    @DBBackupCompleted = COUNT(*)
+FROM
+(
+    SELECT
+        database_name,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY database_name
+            ORDER BY backup_finish_date DESC
+        ) AS rn
+    FROM msdb.dbo.backupset
+    WHERE type = 'D'
+      AND CAST(backup_finish_date AS DATE) = CAST(GETDATE() AS DATE)
+) B
+WHERE rn = 1;
+
+-- Databases uploaded to S3 (Step 2)
+SELECT
+    @S3UploadCompleted = COUNT(*)
+FROM #BackupReport;
+
+-- Missing backups
+SELECT
+    @MissingBackups =
+(
+    SELECT COUNT(*)
+    FROM sys.databases
+    WHERE database_id > 4
+      AND state = 0
+)
+-
+ISNULL(@DBBackupCompleted,0);
+
+
+
+
+DECLARE @S3UploadCompleted INT;
+
+
+
+SELECT
+    @S3UploadCompleted = COUNT(*)
+FROM #BackupReport;
+
+
+
+SELECT
+    @MissingBackups =
+(
+    SELECT COUNT(*)
+    FROM sys.databases
+    WHERE database_id > 4      -- User databases only
+      AND state = 0            -- ONLINE
+)
+-
+ISNULL(@DBBackupCompleted,0);
+
+
+
+<tr>
+    <td style="font-weight:bold;background:#F2F2F2;border:1px solid #ccc;padding:6px;">
+        S3 Upload Completed
+    </td>
+
+    <td style="border:1px solid #ccc;padding:6px;">
+        '+ISNULL(CAST(@S3UploadCompleted AS VARCHAR(20)),'0')+'
+    </td>
+</tr>
+
+
+
+
+
