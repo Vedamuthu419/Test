@@ -1,0 +1,38 @@
+------------------------------------------------------------
+-- Collect backup details from Audit table
+------------------------------------------------------------
+
+CREATE TABLE #TaskList
+(
+    DatabaseName      SYSNAME,
+    TaskID            INT,
+    BackupType        VARCHAR(20),
+    BackupStartTime   DATETIME,
+    BackupEndTime     DATETIME,
+    Status            VARCHAR(20),
+    S3Path            NVARCHAR(1000),
+    ServerName        SYSNAME
+);
+
+INSERT INTO #TaskList
+(
+    DatabaseName,
+    TaskID,
+    BackupType,
+    BackupStartTime,
+    BackupEndTime,
+    Status,
+    S3Path,
+    ServerName
+)
+SELECT
+    DatabaseName,
+    TaskID,
+    BackupType,
+    BackupStartTime,
+    BackupEndTime,
+    Status,
+    S3Path,
+    ServerName
+FROM DBADB.dbo.RDSBackupAudit
+WHERE CAST(BackupStartTime AS DATE) = @ReportDate;
