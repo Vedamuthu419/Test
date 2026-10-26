@@ -366,3 +366,99 @@ ORDER BY ServerName, DriveLetter, LogDate DESC;
 
 
 
+
+
+USE [DBADB];
+GO
+
+;WITH DiskTrend AS
+(
+    SELECT
+        CAST(CaptureTime AS DATE) AS CaptureDate,
+        [ServerName] AS ServerName,
+        DriveLetter,
+        [VolumeName ] AS VolumeName,
+        TotalDisk_GB,
+        UsedDisk_GB,
+        FreeDisk_GB,
+        UsedPct,
+        FreePct,
+        DiskFlag,
+
+        LAG(UsedDisk_GB) OVER
+        (
+            PARTITION BY [ServerName], DriveLetter
+            ORDER BY CaptureTime
+        ) AS PreviousUsedGB,
+
+        LAG(FreeDisk_GB) OVER
+        (
+            PARTITION BY [ServerName], DriveLetter
+            ORDER BY CaptureTime
+        ) AS PreviousFreeGB,
+
+        LAG(UsedPct) OVER
+        (
+            PARTITION BY [ServerName], DriveLetter
+            ORDER BY CaptureTime
+        ) AS PreviousUsedPct,
+
+        LAG(CaptureTime) OVER
+        (
+            PARTITION BY [ServerName], DriveLetter
+            ORDER BY CaptureTime
+        ) AS PreviousCaptureTime
+
+    FROM dbo.DiskDriveUsageHistory
+)
+SELECT
+    CaptureDate,
+    PreviousCaptureTime,
+    ServerName,
+    DriveLetter,
+    VolumeName,
+    TotalDisk_GB,
+    UsedDisk_GB,
+    FreeDisk_GB,
+
+    CAST(UsedDisk_GB - PreviousUsedGB AS DECIMAL(18,2))
+        AS UsedGBChange,
+
+    CASE
+        WHEN PreviousUsedGB IS NULL THEN 'FIRST RECORD'
+        WHEN UsedDisk_GB > PreviousUsedGB THEN 'INCREASE'
+        WHEN UsedDisk_GB < PreviousUsedGB THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS DiskUsageTrend,
+
+    CAST(FreeDisk_GB - PreviousFreeGB AS DECIMAL(18,2))
+        AS FreeGBChange,
+
+    CASE
+        WHEN PreviousFreeGB IS NULL THEN 'FIRST RECORD'
+        WHEN FreeDisk_GB > PreviousFreeGB THEN 'INCREASE'
+        WHEN FreeDisk_GB < PreviousFreeGB THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS FreeSpaceTrend,
+
+    UsedPct,
+
+    CAST(UsedPct - PreviousUsedPct AS DECIMAL(10,2))
+        AS UsedPctChange,
+
+    CASE
+        WHEN PreviousUsedPct IS NULL THEN 'FIRST RECORD'
+        WHEN UsedPct > PreviousUsedPct THEN 'INCREASE'
+        WHEN UsedPct < PreviousUsedPct THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS UtilizationTrend,
+
+    DiskFlag
+
+FROM DiskTrend
+WHERE CaptureDate >= '2026-04-01'
+  AND CaptureDate < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+ORDER BY ServerName, DriveLetter, CaptureDate DESC;
+
+
+
