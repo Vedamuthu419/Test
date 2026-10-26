@@ -64,3 +64,174 @@ WHERE [LoggedAt ] >= DATEADD(DAY, -15, GETDATE())
   AND [LoggedAt ] <= GETDATE()
 GROUP BY CAST([LoggedAt ] AS DATE)
 ORDER BY LogDate DESC;
+
+
+
+1. Daily disk utilization and capacity trend
+USE [DBADB];
+GO
+
+;WITH DailyDrive AS
+(
+    SELECT
+        CAST(CaptureDate AS DATE) AS LogDate,
+        [ServerName ] AS ServerName,
+        DriveLetter,
+        VolumeName,
+        TotalDisk_GB,
+        UsedDisk_GB,
+        FreeDisk_GB,
+        UsedPct,
+        FreePct,
+        GrowthPct,
+        DiskFlag,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY CAST(CaptureDate AS DATE),
+                         [ServerName ],
+                         DriveLetter
+            ORDER BY CaptureTime DESC
+        ) AS rn
+    FROM dbo.DiskDriveUsageHistory
+    WHERE CaptureDate >= DATEADD(DAY, -15, CAST(GETDATE() AS DATE))
+      AND CaptureDate < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+),
+DailySnapshot AS
+(
+    SELECT *
+    FROM DailyDrive
+    WHERE rn = 1
+),
+DriveTrend AS
+(
+    SELECT *,
+        LAG(UsedDisk_GB) OVER
+        (
+            PARTITION BY ServerName, DriveLetter
+            ORDER BY LogDate
+        ) AS PreviousDayUsedGB,
+        LAG(FreeDisk_GB) OVER
+        (
+            PARTITION BY ServerName, DriveLetter
+            ORDER BY LogDate
+        ) AS PreviousDayFreeGB,
+        LAG(UsedPct) OVER
+        (
+            PARTITION BY ServerName, DriveLetter
+            ORDER BY LogDate
+        ) AS PreviousDayUsedPct
+    FROM DailySnapshot
+)
+SELECT
+    LogDate,
+    ServerName,
+    DriveLetter,
+    VolumeName,
+    TotalDisk_GB,
+    UsedDisk_GB,
+    FreeDisk_GB,
+    UsedPct,
+    FreePct,
+    GrowthPct,
+    DiskFlag,
+    CAST(UsedDisk_GB - PreviousDayUsedGB AS DECIMAL(18,2))
+        AS UsedGBChange,
+    CAST(FreeDisk_GB - PreviousDayFreeGB AS DECIMAL(18,2))
+        AS FreeGBChange,
+    CAST(UsedPct - PreviousDayUsedPct AS DECIMAL(10,2))
+        AS UsedPctChange
+FROM DriveTrend
+ORDER BY ServerName, DriveLetter, LogDate DESC;
+
+2. Daily disk I/O trend — last 15 days
+
+USE [DBADB];
+GO
+
+;WITH IOCounters AS
+(
+    SELECT
+        CaptureTime,
+        database_id,
+        file_id,
+        num_of_reads,
+        num_of_writes,
+        io_stall_read_ms,
+        io_stall_write_ms,
+
+        LAG(num_of_reads) OVER
+        (
+            PARTITION BY database_id, file_id
+            ORDER BY CaptureTime
+        ) AS PrevReads,
+
+        LAG(num_of_writes) OVER
+        (
+            PARTITION BY database_id, file_id
+            ORDER BY CaptureTime
+        ) AS PrevWrites,
+
+        LAG(io_stall_read_ms) OVER
+        (
+            PARTITION BY database_id, file_id
+            ORDER BY CaptureTime
+        ) AS PrevReadStall,
+
+        LAG(io_stall_write_ms) OVER
+        (
+            PARTITION BY database_id, file_id
+            ORDER BY CaptureTime
+        ) AS PrevWriteStall
+    FROM dbo.DiskIO_History
+    WHERE CaptureTime >= DATEADD(DAY, -16, GETDATE())
+      AND CaptureTime <= GETDATE()
+),
+IODeltas AS
+(
+    SELECT *,
+        num_of_reads - PrevReads AS ReadDelta,
+        num_of_writes - PrevWrites AS WriteDelta,
+        io_stall_read_ms - PrevReadStall AS ReadStallDelta,
+        io_stall_write_ms - PrevWriteStall AS WriteStallDelta
+    FROM IOCounters
+    WHERE PrevReads IS NOT NULL
+      AND PrevWrites IS NOT NULL
+      AND PrevReadStall IS NOT NULL
+      AND PrevWriteStall IS NOT NULL
+),
+ValidIO AS
+(
+    SELECT *
+    FROM IODeltas
+    WHERE ReadDelta >= 0
+      AND WriteDelta >= 0
+      AND ReadStallDelta >= 0
+      AND WriteStallDelta >= 0
+      AND CaptureTime >= DATEADD(DAY, -15, GETDATE())
+)
+SELECT
+    CAST(CaptureTime AS DATE) AS LogDate,
+    SUM(ReadDelta) AS TotalReadOperations,
+    SUM(WriteDelta) AS TotalWriteOperations,
+    SUM(ReadStallDelta) AS TotalReadStallMS,
+    SUM(WriteStallDelta) AS TotalWriteStallMS,
+
+    CAST(
+        1.0 * SUM(ReadStallDelta)
+        / NULLIF(SUM(ReadDelta), 0)
+        AS DECIMAL(12,2)
+    ) AS AvgReadLatencyMS,
+
+    CAST(
+        1.0 * SUM(WriteStallDelta)
+        / NULLIF(SUM(WriteDelta), 0)
+        AS DECIMAL(12,2)
+    ) AS AvgWriteLatencyMS,
+
+    COUNT(*) AS FileSnapshotCount
+FROM ValidIO
+GROUP BY CAST(CaptureTime AS DATE)
+ORDER BY LogDate DESC;
+
+
+
