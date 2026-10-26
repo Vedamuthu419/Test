@@ -35,6 +35,7 @@ ORDER BY HourlyTime DESC;
 
 
 
+
 3. Daily CPU trend — last 15 days
 Use this query for a simpler daily report.
 
@@ -68,16 +69,17 @@ ORDER BY LogDate DESC;
 
 
 1. Daily disk utilization and capacity trend
+
 USE [DBADB];
 GO
 
 ;WITH DailyDrive AS
 (
     SELECT
-        CAST(CaptureDate AS DATE) AS LogDate,
-        [ServerName ] AS ServerName,
+        CAST(CaptureTime AS DATE) AS LogDate,
+        [ServerName] AS ServerName,
         DriveLetter,
-        VolumeName,
+        [VolumeName ] AS VolumeName,
         TotalDisk_GB,
         UsedDisk_GB,
         FreeDisk_GB,
@@ -87,14 +89,15 @@ GO
         DiskFlag,
         ROW_NUMBER() OVER
         (
-            PARTITION BY CAST(CaptureDate AS DATE),
-                         [ServerName ],
-                         DriveLetter
+            PARTITION BY
+                CAST(CaptureTime AS DATE),
+                [ServerName],
+                DriveLetter
             ORDER BY CaptureTime DESC
         ) AS rn
     FROM dbo.DiskDriveUsageHistory
-    WHERE CaptureDate >= DATEADD(DAY, -15, CAST(GETDATE() AS DATE))
-      AND CaptureDate < DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+    WHERE CaptureTime >= DATEADD(DAY, -16, GETDATE())
+      AND CaptureTime <= GETDATE()
 ),
 DailySnapshot AS
 (
@@ -109,17 +112,17 @@ DriveTrend AS
         (
             PARTITION BY ServerName, DriveLetter
             ORDER BY LogDate
-        ) AS PreviousDayUsedGB,
+        ) AS PreviousUsedGB,
         LAG(FreeDisk_GB) OVER
         (
             PARTITION BY ServerName, DriveLetter
             ORDER BY LogDate
-        ) AS PreviousDayFreeGB,
+        ) AS PreviousFreeGB,
         LAG(UsedPct) OVER
         (
             PARTITION BY ServerName, DriveLetter
             ORDER BY LogDate
-        ) AS PreviousDayUsedPct
+        ) AS PreviousUsedPct
     FROM DailySnapshot
 )
 SELECT
@@ -132,16 +135,42 @@ SELECT
     FreeDisk_GB,
     UsedPct,
     FreePct,
-    GrowthPct,
     DiskFlag,
-    CAST(UsedDisk_GB - PreviousDayUsedGB AS DECIMAL(18,2))
+
+    CAST(UsedDisk_GB - PreviousUsedGB AS DECIMAL(18,2))
         AS UsedGBChange,
-    CAST(FreeDisk_GB - PreviousDayFreeGB AS DECIMAL(18,2))
+
+    CASE
+        WHEN PreviousUsedGB IS NULL THEN 'No Previous Data'
+        WHEN UsedDisk_GB > PreviousUsedGB THEN 'INCREASE'
+        WHEN UsedDisk_GB < PreviousUsedGB THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS DiskUsageTrend,
+
+    CAST(FreeDisk_GB - PreviousFreeGB AS DECIMAL(18,2))
         AS FreeGBChange,
-    CAST(UsedPct - PreviousDayUsedPct AS DECIMAL(10,2))
-        AS UsedPctChange
+
+    CASE
+        WHEN PreviousFreeGB IS NULL THEN 'No Previous Data'
+        WHEN FreeDisk_GB > PreviousFreeGB THEN 'INCREASE'
+        WHEN FreeDisk_GB < PreviousFreeGB THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS FreeSpaceTrend,
+
+    CAST(UsedPct - PreviousUsedPct AS DECIMAL(10,2))
+        AS UsedPctChange,
+
+    CASE
+        WHEN PreviousUsedPct IS NULL THEN 'No Previous Data'
+        WHEN UsedPct > PreviousUsedPct THEN 'INCREASE'
+        WHEN UsedPct < PreviousUsedPct THEN 'DECREASE'
+        ELSE 'NO CHANGE'
+    END AS UtilizationTrend
+
 FROM DriveTrend
+WHERE LogDate >= DATEADD(DAY, -15, CAST(GETDATE() AS DATE))
 ORDER BY ServerName, DriveLetter, LogDate DESC;
+
 
 2. Daily disk I/O trend — last 15 days
 
