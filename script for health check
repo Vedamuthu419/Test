@@ -1,0 +1,66 @@
+1. CPU utilization trend — last 15 days
+This query returns hourly average and peak CPU readings.
+
+SELECT
+    DATEADD(HOUR, DATEDIFF(HOUR, 0, [Time]), 0) AS HourlyTime,
+    AVG(CAST([IdleCPU] AS FLOAT)) AS AvgIdleCPU,
+    AVG(CAST([SQLUtilisedCPU] AS FLOAT)) AS AvgSQLUtilisedCPU,
+    MAX(CAST([SQLUtilisedCPU] AS FLOAT)) AS PeakSQLUtilisedCPU,
+    AVG(CAST([Otherprosses] AS FLOAT)) AS AvgOtherProcessesCPU,
+    MAX(CAST([Otherprosses] AS FLOAT)) AS PeakOtherProcessesCPU
+FROM [DBADB].[dbo].[CPUUtilisationdata]
+WHERE [Time] >= DATEADD(DAY, -15, GETDATE())
+  AND [Time] <= GETDATE()
+GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, [Time]), 0)
+ORDER BY HourlyTime DESC;
+
+
+
+2. Memory performance trend — last 15 days
+Your PageLifeExpectancyLog table stores Page Life Expectancy (PLE). PLE is an indicator of how long data pages remain in the SQL Server buffer pool; it is not a direct memory utilization percentage.
+
+This query returns hourly average and minimum PLE.
+
+SELECT
+    DATEADD(HOUR, DATEDIFF(HOUR, 0, [LoggedAt ]), 0) AS HourlyTime,
+    AVG(CAST([PageLifeExpectancy] AS FLOAT)) AS AvgPLE,
+    MIN([PageLifeExpectancy]) AS MinPLE,
+    MAX([PageLifeExpectancy]) AS MaxPLE,
+    COUNT(*) AS SampleCount
+FROM [DBADB].[dbo].[PageLifeExpectancyLog]
+WHERE [LoggedAt ] >= DATEADD(DAY, -15, GETDATE())
+  AND [LoggedAt ] <= GETDATE()
+GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, [LoggedAt ]), 0)
+ORDER BY HourlyTime DESC;
+
+
+
+3. Daily CPU trend — last 15 days
+Use this query for a simpler daily report.
+
+SELECT
+    CAST([Time] AS DATE) AS LogDate,
+    AVG(CAST([SQLUtilisedCPU] AS FLOAT)) AS AvgSQLCPU,
+    MAX(CAST([SQLUtilisedCPU] AS FLOAT)) AS PeakSQLCPU,
+    AVG(CAST([Otherprosses] AS FLOAT)) AS AvgOtherCPU,
+    AVG(CAST([IdleCPU] AS FLOAT)) AS AvgIdleCPU,
+    COUNT(*) AS SampleCount
+FROM [DBADB].[dbo].[CPUUtilisationdata]
+WHERE [Time] >= DATEADD(DAY, -15, GETDATE())
+  AND [Time] <= GETDATE()
+GROUP BY CAST([Time] AS DATE)
+ORDER BY LogDate DESC;
+
+
+
+SELECT
+    CAST([LoggedAt ] AS DATE) AS LogDate,
+    AVG(CAST([PageLifeExpectancy] AS BIGINT)) AS AvgPLE,
+    MIN([PageLifeExpectancy]) AS MinPLE,
+    MAX([PageLifeExpectancy]) AS PeakPLE,
+    COUNT(*) AS SampleCount
+FROM [DBADB].[dbo].[PageLifeExpectancyLog]
+WHERE [LoggedAt ] >= DATEADD(DAY, -15, GETDATE())
+  AND [LoggedAt ] <= GETDATE()
+GROUP BY CAST([LoggedAt ] AS DATE)
+ORDER BY LogDate DESC;
